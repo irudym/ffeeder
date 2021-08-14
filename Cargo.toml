@@ -15,3 +15,4 @@ uuid = { version = "0.8", features = ["serde", "v4"] }
 serde_json = "1.0.64"
 mysql = "20.1.0"
 websocket = "0.26.2"
+chrono = "0.4.19"

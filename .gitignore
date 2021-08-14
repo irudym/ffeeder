@@ -1,3 +1,4 @@
 /target
 /fennec-feeder-*
 .DS_Store
+/src/.DS_Store

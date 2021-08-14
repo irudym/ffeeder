@@ -14,7 +14,6 @@ fn main() {
 
     //TODO: load credential from ENV!
     let mysql_host = "mysql://phoenix:phoenix@localhost:3306/fennec_dev";
-
     let websocket_host = "ws://127.0.0.1:4000/socket/websocket?vsn=2.0.0";
 
     // Create the client. Use an ID for a persistent session.
@@ -29,29 +28,29 @@ fn main() {
     let storage_sender_ws = storage_sender.clone();
 
     
-    let subscriber = thread::spawn(move || {
-        loop {
-            feeder::subscriber(&mqtt_host, &client_id, &subscriptions, &qos, storage_sender.clone(), 1024);
-            warn!("Reconnection to MQTT broker");
-        }
-    });
+    
 
     let storage = thread::spawn(move || {
+        info!("Start Storage thread...");
         loop {
             feeder::storage(storage_receiver.clone(), db_storage_sender.clone());
             error!("Restarting Storage thread");
         }
     });
+    thread::sleep(Duration::from_secs(3));
 
     let db_storage = thread::spawn(move || {
+        info!("Start DBStorage thread...");
         loop {
             feeder::db_storage(mysql_host, db_storage_receiver.clone());
             error!("Restarting DBStorage thread");
         }
     });
+    thread::sleep(Duration::from_secs(3));
 
 
     let websocket_supervisor = thread::spawn(move || {
+        info!("Start WebSocket Supervisor thread...");
         loop {
             let (sender_sender, sender_receiver) = channel::unbounded();
             let sender_for_pinger = sender_sender.clone();
@@ -84,10 +83,23 @@ fn main() {
             if let Err(error) = sender_loop.join() {
                 error!("WebSocket Sender thread error: {:?}", error);
             }
+
+            if let Err(error) = pinger_loop.join() {
+                error!("WebSocket Pinger thread error: {:?}", error);
+            }
             
             warn!("Reconnection to WebSocket host");
         }
     });
+
+    let subscriber = thread::spawn(move || {
+        info!("Start Subscriber thread...");
+        loop {
+            feeder::subscriber(&mqtt_host, &client_id, &subscriptions, &qos, storage_sender.clone(), 1024);
+            warn!("Reconnection to MQTT broker");
+        }
+    });
+    thread::sleep(Duration::from_secs(3));
 
     subscriber.join().unwrap();
     storage.join().unwrap();
