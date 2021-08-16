@@ -1,6 +1,5 @@
-use std::{ process, time::Duration, thread };
-use paho_mqtt as mqtt;
-use log::{info, trace, warn, error};
+use std::{ time::Duration, thread };
+use log::{info, warn, error};
 use uuid::Uuid;
 use crossbeam::channel;
 use ffeeder::feeder;
@@ -65,7 +64,7 @@ fn main() {
             phoenix::join_phoenix(sender_sender.clone());
 
             let receiver_loop = std::thread::spawn(move || {
-                phoenix::receiver(receiver, sender_sender.clone(), storage_sender_2.clone());
+                phoenix::receiver(receiver, sender_sender.clone(), storage_sender_2);
             });
 
             let sender_loop = std::thread::spawn(move || {
@@ -73,7 +72,7 @@ fn main() {
             });
 
             let pinger_loop = std::thread::spawn(move || {
-                phoenix::pinger(5000, sender_for_pinger.clone());
+                phoenix::pinger(5000, sender_for_pinger);
             });
 
             if let Err(error) = receiver_loop.join() {

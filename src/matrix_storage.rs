@@ -52,6 +52,12 @@ impl<T: Copy + Clone> MatrixStorage<T> {
     }
 }
 
+impl<T: Copy + Clone> Default for MatrixStorage<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

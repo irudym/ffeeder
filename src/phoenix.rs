@@ -1,7 +1,7 @@
 // WebSocket communication with Elixir Phoenix backend
 //  
 
-use log::{error, info, warn, trace};
+use log::{error, info, warn};
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
@@ -11,9 +11,10 @@ use websocket::result::{WebSocketError, WebSocketResult};
 use websocket::sender::Writer;
 use websocket::{ClientBuilder, Message, OwnedMessage};
 use crossbeam::channel;
-use serde_json::{Result, Value};
+use serde_json::{Value};
 
-use super::feeder::Command;
+use super::commands::*;
+// use super::commands::Command::*;
 
 pub fn connect(host: &str) -> WebSocketResult<Client<TcpStream>> {
     match ClientBuilder::new(host) {
@@ -24,7 +25,7 @@ pub fn connect(host: &str) -> WebSocketResult<Client<TcpStream>> {
 
 pub fn reconnect(host: &str) -> Client<TcpStream> {
     match connect(host) {
-        Ok(client) => return client,
+        Ok(client) => client,
         Err(error) => {
             error!("Error: {:?}", error);
             warn!("Reconnect...");

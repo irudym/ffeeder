@@ -6,38 +6,17 @@ use std::{
 use std::sync::mpsc::Receiver;
 use std::collections::BTreeMap;
 use paho_mqtt as mqtt;
-use log::{info, trace, warn, error};
+use log::{info, warn, error};
 use crossbeam::channel;
-use serde_json::{Result, Value, Map};
+use serde_json::{Value};
 use mysql::prelude::*;
 use mysql::Pool;
 use mysql::params;
 use chrono::prelude::*;
 
-use super::matrix_storage::*;
-
-#[derive(Debug)]
-pub enum Command {
-    Add(String, String),
-    Store(usize, BTreeMap<usize, String>),
-    Load(channel::Sender<DeviceMap>),                   // load devices from DB
-    UpdateDeviceList(DeviceMap),
-    Activate(usize, String), // id and uid
-    ActivateUnit(usize, String), // id and name
-    LoadUnits(channel::Sender<UnitMap>),
-    CreateUnit(String, channel::Sender<Option<usize>>),
-    LoadDevicesUnits(channel::Sender<DevicesUnitsStorage>), //load table with lnk between devices and units 
-    GetUnit(String, channel::Sender<Option<usize>>), // get unit id by name, or create a new record in DB in case of none
-    CheckDeviceUnit(usize, usize, channel::Sender<bool>), //device_id, unit_id; check if a device has measurements by specific unit type
-    LinkDeviceToUnit(usize, usize), //device_id, unit_id  
-    Disconnect,
-}
-
-
-pub type DeviceMap = BTreeMap<String, Option<usize>>;  //device UID and id (from DB)
-pub type UnitMap = BTreeMap<String, usize>; // unit name and id (from DB)
-pub type DevicesUnitsStorage = MatrixStorage<bool>; // unit_id: array of device_ids
-
+use super::units_storage::*;
+use super::commands::*;
+// use super::commands::Command::*;
 
 
 pub fn mqtt_connect(mqtt_host: &str, client_id: &str, subscriptions: &[&str], qos: &[i32]) -> (mqtt::Client, Receiver<Option<mqtt::Message>>) {
@@ -68,7 +47,7 @@ pub fn mqtt_connect(mqtt_host: &str, client_id: &str, subscriptions: &[&str], qo
                     // Register subscriptions on the server
                     info!("Subscribing to topics, with requested QoS: {:?}...", qos);
 
-                    match mqtt_client.subscribe_many(&subscriptions, &qos) {
+                    match mqtt_client.subscribe_many(subscriptions, qos) {
                         Ok(qosv) => info!("QoS granted: {:?}", qosv),
                         Err(e) => {
                             error!("Error subscribing to topics: {:?}", e);
@@ -91,7 +70,7 @@ pub fn mqtt_connect(mqtt_host: &str, client_id: &str, subscriptions: &[&str], qo
 
 pub fn subscriber(mqtt_host: &str, client_id: &str, subscriptions: &[&str], qos: &[i32], storage_sender: channel::Sender<Command>, max_payload_size: usize) {
     // Make the connection to the broker
-    let ( mqtt_client, mqtt_message_receiver ) = mqtt_connect(&mqtt_host, &client_id, &subscriptions, &qos);
+    let ( mqtt_client, mqtt_message_receiver ) = mqtt_connect(mqtt_host, client_id, subscriptions, qos);
 
     // Just loop on incoming messages.
     // If we get a None message, check if we got disconnected,
@@ -105,7 +84,7 @@ pub fn subscriber(mqtt_host: &str, client_id: &str, subscriptions: &[&str], qos:
                     error!("Payload size is unacceptable (bigger than {} bytes", max_payload_size);
                 } else {
                     // device UID
-                    let device_id = message.topic().split("/").nth(1).unwrap_or("");
+                    let device_id = message.topic().split('/').nth(1).unwrap_or("");
                     // info!("Send message: STORE({})", message.payload_str());
                     if let Err(error) = storage_sender.send(Add(device_id.to_string(), message.payload_str().to_string())) {
                         error!("{}", error);
@@ -123,112 +102,11 @@ pub fn subscriber(mqtt_host: &str, client_id: &str, subscriptions: &[&str], qos:
     // otherwise we're already disconnected.
     if mqtt_client.is_connected() {
         warn!("Disconnecting...");
-        mqtt_client.unsubscribe_many(&subscriptions).unwrap();
+        mqtt_client.unsubscribe_many(subscriptions).unwrap();
         mqtt_client.disconnect(None).unwrap();
     }
 }
 
-
-/// A thread which is responsible to store units list and units-devices relationship matrix. 
-/// The storage behaves like a cache between DB and the feeder thread
-/// The function is used in Storage thread
-pub fn units_storage(units_storage_receiver: channel::Receiver<Command>, db_storage_sender: channel::Sender<Command>) {
-    use Command::*;
-
-    // update list of units
-    let mut units = UnitMap::new();
-    let mut units_devices = DevicesUnitsStorage::new();
-    let (units_sender, units_receiver) = channel::bounded(1);
-
-    if let Err(error) = db_storage_sender.send(LoadUnits(units_sender)) {
-        error!("Storage thread error: {}", error);
-        thread::sleep(Duration::from_millis(5000));
-
-        // restart the thread
-        return;
-    }
-    // update list of units
-    if let Ok(message) = units_receiver.recv() {
-        units = message;
-        info!("Loaded {} units", units.len());
-    }
-
-    let (devices_units_sender, devices_units_receiver) = channel::bounded(1);
-    if let Err(error) = db_storage_sender.send(LoadDevicesUnits(devices_units_sender)) {
-        error!("Storage thread error: {}", error);
-        thread::sleep(Duration::from_millis(5000));
-
-        // restart the thread
-        return;
-    }
-
-    // update list of relationship between units and devices
-    if let Ok(message) = devices_units_receiver.recv() {
-        units_devices = message;
-        info!("Loaded {} units-devices relationships", units_devices.rows_count());
-        info!("Units_Devices: {:?}", units_devices);
-    } else {
-        error!("Cannot load units-devices relationship matrix, use empty list instead!");
-    }
-
-    while let Ok(message) = units_storage_receiver.recv() {
-        match message {
-            LinkDeviceToUnit(device_id, unit_id) => {
-                units_devices.add(unit_id, device_id, true);
-                // create a record in DB
-                if let Err(error) = db_storage_sender.send(LinkDeviceToUnit(device_id, unit_id)) {
-                    error!("Units Storage thread error: {}", error);
-                }
-            },
-            CheckDeviceUnit(device_id, unit_id, sender) => {
-                if let Some(_) = units_devices.get(unit_id, device_id) {
-                    if let Err(error) = sender.send(true) {
-                        error!("Units Storage thread error: {}", error);
-                    }
-                } else {
-                    if let Err(error) = sender.send(false) {
-                        error!("Units Storage thread error: {}", error);
-                    }
-                }
-            },
-            GetUnit(name, sender) => {
-                if let Some(id) = units.get(&name) {
-                    if let Err(error) = sender.send(Some(*id)) {
-                        error!("Units Storage thread error: {}", error);
-                    }
-                } else {
-                    // add unit to the list and to DB
-                    let mut unit_id:Option<usize> = None;
-                    warn!("Cannot find Unit named: {}. Create unit record in DB", &name);
-                    let (units_sender, units_receiver) = channel::bounded(1);
-                    if let Err(error) = db_storage_sender.send(CreateUnit(name.clone(), units_sender)) {
-                        error!("Storage thread error: {}", error);
-                    }
-                    
-                    // get response from DB
-                    if let Ok(message) = units_receiver.recv() {
-                        match message {
-                            Some(id) => {
-                                units.insert(name, id);
-                            },
-                            None => {
-                                error!("Unit ID is unknown!");
-                            }
-                        }
-                        unit_id = message;
-                    }
-
-                    if let Err(error) = sender.send(unit_id) {
-                        error!("Storage thread error: {}", error);
-                    }
-                };
-            },
-            _ => {
-                warn!("Units Storage thread: unimplemented message: {:?}", message);
-            }
-        }
-    }
-}
 
 pub fn storage(storage_receiver: channel::Receiver<Command>, db_storage_sender: channel::Sender<Command>) {
     let mut devices = DeviceMap::new(); // if ID from database provided, then the device is active, otherwise it's NONE
@@ -313,7 +191,7 @@ pub fn storage(storage_receiver: channel::Receiver<Command>, db_storage_sender: 
                                             }
 
                                             // check if the device can send measurement with this unit
-                                            let (ud_sender, ud_receiver) = channel::bounded(1);
+                                            let (ud_sender, ud_receiver):(channel::Sender<bool>, channel::Receiver<bool>) = channel::bounded(1);
                                             if let Some(unit_id) = unit_id {
                                                 if let Err(error) = process_units_storage_sender.send(CheckDeviceUnit(device_id, unit_id, ud_sender)) {
                                                     error!("Processing thread error: {}", error);
@@ -404,7 +282,7 @@ pub fn db_storage(db_host: &str, db_storage_receiver: channel::Receiver<Command>
                 let _list_of_records = conn
                     .query_map("SELECT unit_id, device_id FROM devices_units;", |(unit_id, device_id)| {
                         // get units vector
-                        devices_units.add(unit_id, device_id, true);
+                        devices_units.add(unit_id, device_id, ());
                         info!("Record: {:?} : {:?} ", unit_id, device_id);
                 });
                 if let Err(error) = sender.send(devices_units) {
